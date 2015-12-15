@@ -1,0 +1,7 @@
+Makefile.PL
+LICENSE
+MANIFEST
+README.md
+t/Geo-OGC-Service-SOS.t
+t/Geo-OGC-Service-SOS.conf
+lib/Geo/OGC/Service/SOS.pm
