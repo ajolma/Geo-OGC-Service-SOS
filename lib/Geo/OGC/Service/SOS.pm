@@ -43,8 +43,9 @@ use Data::Dumper;
 use XML::LibXML::PrettyPrint;
 
 use Geo::OGC::Service;
+use Geo::OGC::Service::Filter ':all';
 use vars qw(@ISA);
-push @ISA, qw(Geo::OGC::Service::Common);
+push @ISA, qw(Geo::OGC::Service::Filter);
 
 our $VERSION = '0.01';
 
@@ -87,17 +88,25 @@ sub process_request {
         }
     }
     for ($self->{request}{request} // '') {
-        if (/^GetCapabilities/ or /^capabilities/) { $self->GetCapabilities() }
-        elsif (/^DescribeFeatureType/)             { $self->DescribeFeatureType() }
-        elsif (/^GetFeature/)                      { $self->GetFeature() }
-        elsif (/^Transaction/)                     { $self->Transaction() }
-        elsif (/^$/)                               { 
+        if (/^GetCapabilities/)         { $self->GetCapabilities() }
+        elsif (/^DescribeSensor/)       { $self->DescribeSensor() }
+        elsif (/^GetObservation/)       { $self->GetObservation() }
+        elsif (/^GetFeatureOfInterest/) { $self->GetFeatureOfInterest() }
+        elsif (/^GetObservationById/)   { $self->GetObservationById() }
+        elsif (/^InsertSensor/)         { $self->InsertSensor() }
+        elsif (/^DeleteSensor/)         { $self->DeleteSensor() }
+        elsif (/^InsertObservation/)    { $self->InsertObservation() }
+        elsif (/^InsertResultTemplate/) { $self->InsertResultTemplate() }
+        elsif (/^InsertResult/)         { $self->InsertResult() }
+        elsif (/^GetResultTemplate/)    { $self->GetResultTemplate() }
+        elsif (/^GetResult/)            { $self->GetResult() }
+        elsif (/^$/)                    { 
             $self->error({ exceptionCode => 'MissingParameterValue',
                            locator => 'request' }) }
-        else                                       { 
+        else                            { 
             $self->error({ exceptionCode => 'InvalidParameterValue',
                            locator => 'request',
-                           ExceptionText => "$self->{parameters}{request} is not a known request" }) }
+                           ExceptionText => "$self->{request}{request} is not a known request" }) }
     }
 }
 
@@ -125,23 +134,14 @@ sub GetCapabilities {
 
     my $writer = Geo::OGC::Service::XMLWriter::Caching->new();
 
-    my %inspireNameSpace = (
-        'xmlns:inspire_dls' => "http://inspire.ec.europa.eu/schemas/inspire_dls/1.0",
-        'xmlns:inspire_common' => "http://inspire.ec.europa.eu/schemas/common/1.0"
-        );
-    my $inspireSchemaLocations = 
-        'http://inspire.ec.europa.eu/schemas/common/1.0 '.
-        'http://inspire.ec.europa.eu/schemas/common/1.0/common.xsd '.
-        'http://inspire.ec.europa.eu/schemas/inspire_dls/1.0 '.
-        'http://inspire.ec.europa.eu/schemas/inspire_dls/1.0/inspire_dls.xsd';
-    
     my %ns;
     if ($self->{version} eq '2.0.0') {
         %ns = (
-            xmlns => "http://www.opengis.net/wfs/2.0" ,
+            xmlns => "http://www.opengis.net/sos/2.0" ,
+            'xmlns:sos' => "http://schemas.opengis.net/sos/2.0",
             'xmlns:gml' => "http://schemas.opengis.net/gml",
-            'xmlns:wfs' => "http://www.opengis.net/wfs/2.0",
             'xmlns:ows' => "http://www.opengis.net/ows/1.1",
+            'xmlns:om' => "http://www.opengis.net/om/1.0",
             'xmlns:xlink' => "http://www.w3.org/1999/xlink",
             'xmlns:xsi' => "http://www.w3.org/2001/XMLSchema-instance",
             'xmlns:fes' => "http://www.opengis.net/fes/2.0",
@@ -149,27 +149,28 @@ sub GetCapabilities {
             'xmlns:srv' => "http://schemas.opengis.net/iso/19139/20060504/srv/srv.xsd",
             'xmlns:gmd' => "http://schemas.opengis.net/iso/19139/20060504/gmd/gmd.xsd",
             'xmlns:gco' => "http://schemas.opengis.net/iso/19139/20060504/gco/gco.xsd",
-            'xsi:schemaLocation' => "http://www.opengis.net/wfs/2.0 http://schemas.opengis.net/wfs/2.0/wfs.xsd",
+            'xsi:schemaLocation' => "http://www.opengis.net/sos/2.0 http://schemas.opengis.net/sos/2.0.0/sosAll.xsd",
             );
         # updateSequence="260" ?
     } else {
         %ns = (
-            xmlns => "http://www.opengis.net/wfs",
+            xmlns => "http://www.opengis.net/sos/1.0",
+            'xmlns:sos' => "http://www.opengis.net/sos/1.0",
             'xmlns:gml' => "http://www.opengis.net/gml",
-            'xmlns:wfs' => "http://www.opengis.net/wfs",
             'xmlns:ows' => "http://www.opengis.net/ows",
+            'xmlns:om' => "http://www.opengis.net/om/1.0",
             'xmlns:xlink' => "http://www.w3.org/1999/xlink",
             'xmlns:xsi' => "http://www.w3.org/2001/XMLSchema-instance",
             'xmlns:ogc' => "http://www.opengis.net/ogc",
-            'xsi:schemaLocation' => "http://www.opengis.net/wfs http://schemas.opengis.net/wfs/1.1.0/wfs.xsd"
+            'xsi:schemaLocation' => "http://www.opengis.net/sos/1.0 http://schemas.opengis.net/sos/1.0.0/sosAll.xsd"
             );
     }
     $ns{version} = $self->{version};
 
-    $writer->open_element('wfs:WFS_Capabilities', \%ns);
+    $writer->open_element('sos:Capabilities', \%ns);
     $self->DescribeService($writer);
     $self->OperationsMetadata($writer);
-    $self->FeatureTypeList($writer);
+    $self->ObservationOfferingList($writer);
     $self->Filter_Capabilities($writer);
     $writer->close_element;
     $writer->stream($self->{responder});
@@ -178,235 +179,258 @@ sub GetCapabilities {
 sub OperationsMetadata  {
     my ($self, $writer) = @_;
     $writer->open_element('ows:OperationsMetadata');
-    my @versions = split /,/, $self->{config}{AcceptVersions} // '2.0.0,1.1.0,1.0.0';
-    $self->Operation($writer, 'GetCapabilities',
-                     { Get => 1, Post => 1 },
-                     [{service => ['WFS']}, 
-                      {AcceptVersions => \@versions}, 
-                      {AcceptFormats => ['text/xml']}]);
-    $self->Operation($writer, 'DescribeFeatureType', 
-                     { Get => 1, Post => 1 },
-                     [{outputFormat => [sort keys %OutputFormats]}]);
-    $self->Operation($writer, 'GetFeature',
-                     { Get => 1, Post => 1 },
-                     [{resultType => ['results']}, {outputFormat => [sort keys %OutputFormats]}]);
-    $self->Operation($writer, 'Transaction',
-                     { Get => 1, Post => 1 },
-                     [{inputFormat => ['text/xml; subtype=gml/3.1.1']}, 
-                      {idgen => ['GenerateNew','UseExisting','ReplaceDuplicate']},
-                      {releaseAction => ['ALL','SOME']}
+    
+    $self->Operation($writer, 'GetCapabilities', { Get => 1, Post => 1 },
+                     [ {Sections => [AllowedValues => 
+                                     [qw/ServiceIdentification ServiceProvider OperationsMetadata Contents All/]]}
                      ]);
-    # constraints
-    my %constraints = (
-        ImplementsBasicWFS => 1,
-        ImplementsTransactionalWFS => 1,
-        ImplementsLockingWFS => 0,
-        KVPEncoding => 1,
-        XMLEncoding => 1,
-        SOAPEncoding => 0,
-        ImplementsInheritance => 0,
-        ImplementsRemoteResolve => 0,
-        ImplementsResultPaging => 0,
-        ImplementsStandardJoins => 1,
-        ImplementsSpatialJoins => 1,
-        ImplementsTemporalJoins => 1,
-        ImplementsFeatureVersioning => 0,
-        ManageStoredQueries => 0,
-        PagingIsTransactionSafe => 1,
-        );
-    for my $key (keys %constraints) {
-        $writer->element('ows:Constraint', {name => $key}, 
-                         [['ows:NoValues'], 
-                          ['ows:DefaultValue' => $constraints{$key} ? 'TRUE' : 'FALSE']]);
-    }
-    $writer->element('ows:Constraint', {name => 'QueryExpressions'}, 
-                     ['ows:AllowedValues' => ['ows:Value' => 'wfs:Query']]);
+    
+    $self->Operation($writer, 'DescribeSensor', { Get => 1, Post => 1 },
+                     [ {outputFormat => [AllowedValues => ['text/xml;subtype="sensorML"']]}
+                     ]);
+    
+    $self->Operation($writer, 'GetObservation', { Get => 1, Post => 1 },
+                     [ {offering => [AllowedValues => ['stationid']]},
+                       {observedProperty => [AllowedValues => ['water_temperature']]},
+                       {responseFormat => [AllowedValues => ['text/tab-separated-values']]},
+                       {eventTime => [AllowedValues => ['eventTime element']]},
+                       {procedure => [AllowedValues => ['procedure element']]},
+                       {result => [AllowedValues => ['']]},
+                       {unit => [AllowedValues => ['Meters', 'Celsius']]},
+                       {timeZone => [AllowedValues => ['EET']]},
+                       {epoch => [AllowedValues => ['']]},
+                       {dataType => [AllowedValues => ['']]},
+                     ]);
+
+    my @versions = split /,/, $self->{config}{AcceptVersions} // '2.0.0,1.0.0';
+
+    $writer->element($self->Parameter(service => [AllowedValues => ['SOS']]));
+    $writer->element($self->Parameter(version => [AllowedValues => \@versions]));
+    $writer->element('ows:ExtendedCapabilities' => '');
+    
     $writer->close_element;
 }
 
-sub Filter_Capabilities  {
+sub ObservationOfferingList {
     my ($self, $writer) = @_;
-    my $ns = $self->{version} eq '2.0.0' ? 'fes' : 'ogc';
-    $writer->open_element($ns.':Filter_Capabilities');
+    $writer->open_element('sos:Contents');
+    $writer->open_element('sos:ObservationOfferingList');
 
-    # Conformance
-    my %Constraints = ( 
-        ImplementsQuery => [['ows:NoValues'], ['ows:DefaultValue' => 'TRUE']],
-        ImplementsAdHocQuery => [['ows:NoValues'], ['ows:DefaultValue' => 'TRUE']],
-        ImplementsFunctions => [['ows:NoValues'], ['ows:DefaultValue' => 'TRUE']],
-        ImplementsMinStandardFilter => [['ows:NoValues'], ['ows:DefaultValue' => 'TRUE']],
-        ImplementsStandardFilter => [['ows:NoValues'], ['ows:DefaultValue' => 'FALSE']],
-        ImplementsMinSpatialFilter => [['ows:NoValues'], ['ows:DefaultValue' => 'TRUE']],
-        ImplementsSpatialFilter => [['ows:NoValues'], ['ows:DefaultValue' => 'FALSE']],
-        ImplementsMinTemporalFilter => [['ows:NoValues'], ['ows:DefaultValue' => 'TRUE']],
-        ImplementsTemporalFilter => [['ows:NoValues'], ['ows:DefaultValue' => 'TRUE']],
-        ImplementsVersionNav => [['ows:NoValues'], ['ows:DefaultValue' => 'FALSE']],
-        ImplementsSorting => [['ows:AllowedValues' => [['ows:Value' => 'ASC'], ['ows:Value' => 'DESC']]], 
-                              ['ows:DefaultValue' => 'ASC']],
-        ImplementsExtendedOperators => [['ows:NoValues'], ['ows:DefaultValue' => 'FALSE']],
-        );
-    my @c;
-    for my $key (keys %Constraints) {
-        push @c, [$ns.':Constraint', {name=>$key}, $Constraints{$key}];
-    }
-    $writer->element($ns.':Conformance', \@c);
-
-    my @ids;
-    if ($ns eq 'ogc') {
-        @ids = ([$ns.':FID']);
-    } else {
-        @ids = (['fes:ResourceIdentifier', {name => 'fes:ResourceId'}]);
-    }
-    $writer->element($ns.':Id_Capabilities', \@ids);
-
-    my @operators = ();    
-    for my $o (qw/LessThan GreaterThan LessThanOrEqualTo GreaterThanOrEqualTo EqualTo NotEqualTo Like Between Null/) {
-        if ($ns eq 'ogc') {
-            push @operators, [$ns.':ComparisonOperator', 'PropertyIs'.$o];
-        } else {
-            push @operators, [$ns.':ComparisonOperator', { name => 'PropertyIs'.$o}];
+    for my $o ($self->offerings) {
+        my @attr = (['gml:description' => $o->{descr}],
+                    ['gml:name' => $o->{name}],
+                    ['gml:boundedBy' => $o->{env}],
+                    ['sos:time' => $o->{time}],
+                    ['sos:procedure' => $o->{proc}]);
+        for my $p (@{$o->{prop}}) {
+            push @attr, ['sos:observedProperty' => $p];
         }
-    }
-    $writer->element($ns.':Scalar_Capabilities', 
-                [[$ns.':LogicalOperators'], # empty ?
-                 [$ns.':ComparisonOperators', \@operators]]);
-
-    my @operands = ();
-    for my $o (keys %gml_geometry_type) {
-        if ($ns eq 'ogc') {
-            push @operands, [$ns.':GeometryOperand', 'gml:'.$o];
-        } else {
-            push @operands, [$ns.':GeometryOperand', { name => 'gml:'.$o }];
+        for my $p (@{$o->{foi}}) {
+            push @attr, ['sos:featureOfInterest' => $p];
         }
-    }
-    @operators = ();
-    my @op = keys %spatial2op;
-    push @op, (qw/DWithin BBOX/);
-    for my $o (@op) {
-        push @operators, [$ns.':SpatialOperator', { name => $o }];
-    }
-    $writer->element($ns.':Spatial_Capabilities', 
-                [[$ns.':GeometryOperands', \@operands],
-                 [$ns.':SpatialOperators', \@operators]]);
-
-    # Temporal_Capabilities
-
-    @operands = ();
-    for my $o (qw/TimeInstant TimePeriod/) {
-        if ($ns eq 'ogc') {
-            push @operands, [$ns.':GeometryOperand', 'gml:'.$o];
-        } else {
-            push @operands, [$ns.':GeometryOperand', { name => 'gml:'.$o }];
+        for my $p (@{$o->{format}}) {
+            push @attr, ['sos:responseFormat' => $p];
         }
+        push @attr, ['sos:resultModel' => $o->{model}];
+        push @attr, ['sos:responseMode' => $o->{mode}];
+        $writer->element('sos:ObservationOffering' => {'gml:id' => $o->{id}}, \@attr);
     }
-    @operators = ();
-    @op = keys %temporal_operators;
-    for my $o (@op) {
-        push @operators, [$ns.':TemporalOperator', { name => $o }];
-    }
-    $writer->element($ns.':Temporal_Capabilities', 
-                     [[$ns.':TemporalOperands', \@operands],
-                      [$ns.':TemporalOperators', \@operators]]);
 
-    # Functions
-    
-    my @functions;
-    for my $f (sort keys %functions) {
-        my @args = ();
-        my $args = $functions{$f}[1];
-        for my $arg (@$args) {
-            push @args, [$ns.':Argument', { name => $arg->[0]}, [$ns.':Type' => $arg->[1]]];
-        }
-        push @functions, [$ns.':Function', { name => $f }, 
-                          [[$ns.':Returns' => $functions{$f}[0]] ,[$ns.':Arguments' => \@args]]];
-    }
-    $writer->element($ns.':Functions', \@functions);
-    
+    $writer->close_element;
     $writer->close_element;
 }
 
 =pod
 
-=head3 DescribeFeatureType
-
-Service the DescribeFeatureType request.
+=head3 DescribeSensor
 
 =cut
 
-sub DescribeFeatureType {
+sub DescribeSensor {
     my ($self) = @_;
+    $self->error({ exceptionCode => 'NotImplemented',
+                   locator => 'request',
+                   ExceptionText => "$self->{request}{request} is not yet implemented." })
+}
 
-    my @typenames;
-    for my $query (@{$self->{request}{queries}}) {
-        push @typenames, split(/\s*,\s*/, $query->{typename});
+=pod
+
+=head3 GetObservation
+
+=cut
+
+sub GetObservation {
+    my ($self) = @_;
+    $self->error({ exceptionCode => 'NotImplemented',
+                   locator => 'request',
+                   ExceptionText => "$self->{request}{request} is not yet implemented." })
+}
+
+=pod
+
+=head3 GetFeatureOfInterest
+
+=cut
+
+sub GetFeatureOfInterest {
+    my ($self) = @_;
+    $self->error({ exceptionCode => 'NotImplemented',
+                   locator => 'request',
+                   ExceptionText => "$self->{request}{request} is not yet implemented." })
+}
+
+=pod
+
+=head3 GetObservationById
+
+=cut
+
+sub GetObservationById {
+    my ($self) = @_;
+    $self->error({ exceptionCode => 'NotImplemented',
+                   locator => 'request',
+                   ExceptionText => "$self->{request}{request} is not yet implemented." })
+}
+
+=pod
+
+=head3 InsertSensor
+
+=cut
+
+sub InsertSensor {
+    my ($self) = @_;
+    $self->error({ exceptionCode => 'NotImplemented',
+                   locator => 'request',
+                   ExceptionText => "$self->{request}{request} is not yet implemented." })
+}
+
+=pod
+
+=head3 DeleteSensor
+
+=cut
+
+sub DeleteSensor {
+    my ($self) = @_;
+    $self->error({ exceptionCode => 'NotImplemented',
+                   locator => 'request',
+                   ExceptionText => "$self->{request}{request} is not yet implemented." })
+}
+
+=pod
+
+=head3 InsertObservation
+
+=cut
+
+sub InsertObservation {
+    my ($self) = @_;
+    $self->error({ exceptionCode => 'NotImplemented',
+                   locator => 'request',
+                   ExceptionText => "$self->{request}{request} is not yet implemented." })
+}
+
+=pod
+
+=head3 InsertResultTemplate
+
+=cut
+
+sub InsertResultTemplate {
+    my ($self) = @_;
+    $self->error({ exceptionCode => 'NotImplemented',
+                   locator => 'request',
+                   ExceptionText => "$self->{request}{request} is not yet implemented." })
+}
+
+=pod
+
+=head3 InsertResult
+
+=cut
+
+sub InsertResult {
+    my ($self) = @_;
+    $self->error({ exceptionCode => 'NotImplemented',
+                   locator => 'request',
+                   ExceptionText => "$self->{request}{request} is not yet implemented." })
+}
+
+=pod
+
+=head3 GetResultTemplate
+
+=cut
+
+sub GetResultTemplate {
+    my ($self) = @_;
+    $self->error({ exceptionCode => 'NotImplemented',
+                   locator => 'request',
+                   ExceptionText => "$self->{request}{request} is not yet implemented." })
+}
+
+=pod
+
+=head3 GetResult
+
+=cut
+
+sub GetResult {
+    my ($self) = @_;
+    $self->error({ exceptionCode => 'NotImplemented',
+                   locator => 'request',
+                   ExceptionText => "$self->{request}{request} is not yet implemented." })
+}
+
+sub parse_request {
+    my $self = shift;
+    if ($self->{posted}) {
+        $self->{request} = ogc_request($self->{posted});
+    } elsif ($self->{parameters}) {
+        $self->{request} = {
+            request => $self->{parameters}{request},
+            version => $self->{parameters}{version},
+            outputformat => $self->{parameters}{outputformat}
+        };
     }
 
-    unless (@typenames) {
-        $self->error({ exceptionCode => 'MissingParameterValue',
-                       locator => 'typeName' });
-        return;
+    my %defaults = (
+        version => '2.0.0',
+        Title => 'SOS Server',
+        );
+    for my $key (keys %defaults) {
+        $self->{config}{$key} //= $defaults{$key};
     }
-    
-    my %types;
-
-    for my $name (@typenames) {
-        $types{$name} = $self->feature_type($name);
-        unless ($types{$name}) {
-            $self->error({ exceptionCode => 'InvalidParameterValue',
-                           locator => 'typeName',
-                           ExceptionText => "Type '$name' is not available" });
-            return;
-        }
+    for my $key (qw/resource ServiceTypeVersion/) {
+        $self->{config}{$key} //= '';
     }
+    # version negotiation
+    $self->{version} = 
+        latest_version($self->{parameters}{acceptversions}) // # not in standard, QGIS WFS 2.0 Client uses
+        $self->{request}{version} // 
+        $self->{config}{version};
+}
 
-    my $writer = Geo::OGC::Service::XMLWriter::Caching->new();
-    $writer->open_element(
-        'schema', 
-        { version => '0.1',
-          targetNamespace => "http://mapserver.gis.umn.edu/mapserver",
-          xmlns => "http://www.w3.org/2001/XMLSchema",
-          'xmlns:ogr' => "http://ogr.maptools.org/",
-          'xmlns:ogc' => "http://www.opengis.net/ogc",
-          'xmlns:xsd' => "http://www.w3.org/2001/XMLSchema",
-          'xmlns:gml' => "http://www.opengis.net/gml",
-          elementFormDefault => "qualified" });
-    $writer->element(
-        'import', 
-        { namespace => "http://www.opengis.net/gml",
-          schemaLocation => "http://schemas.opengis.net/gml/2.1.2/feature.xsd" } );
+sub offerings {
+    my $self = shift;
+    my @offerings;
 
-    for my $name (sort keys %types) {
-        my $type = $types{$name};
-        next if $type->{"gml:id"} && $type->{Name} eq $type->{"gml:id"};
-
-        my ($pseudo_credentials) = pseudo_credentials($type);
-        my @elements;
-        for my $property (keys %{$type->{Schema}}) {
-
-            next if $pseudo_credentials->{$property};
-
-            my $minOccurs = 0;
-            push @elements, ['element', 
-                             { name => $type->{Schema}{$property}{out_name},
-                               type => $type->{Schema}{$property}{out_type},
-                               minOccurs => "$minOccurs",
-                               maxOccurs => "1" } ];
-
-        }
-        $writer->element(
-            'complexType', {name => $type->{Name}.'Type'},
-            ['complexContent', 
-             ['extension', { base => 'gml:AbstractFeatureType' },
-              ['sequence', \@elements
-              ]]]);
-        $writer->element(
-            'element', { name => $type->{Name},
-                         type => 'ogr:'.$type->{Name}.'Type',
-                         substitutionGroup => 'gml:_Feature' } );
-    }
-    
-    $writer->close_element();
-    $writer->stream($self->{responder});
+    my $o = {
+        id => 0,
+        descr => 'Description',
+        name => 'Name',
+        env => 'GML Envelope here',
+        time => 'Timeperiod of measurements?',
+        proc => 'Procedure how this was done',
+        prop => ['Observed property 1', 'Observed property 2'],
+        foi => ['Feature of interest 1', 'feature of interest 2'],
+        'format' => ['response format 1', 'response format 2'],
+        model => 'om:Result model here',
+        mode => 'response mode?',
+    };
+    push @offerings, $o;
+    return @offerings;
 }
 
 1;
