@@ -26,11 +26,9 @@ None by default.
 
 package Geo::OGC::Service::SOS;
 
-use 5.010000; # say // and //=
-use feature "switch";
+use Modern::Perl;
 use Carp;
 use File::Basename;
-use Modern::Perl;
 use Capture::Tiny ':all';
 use Clone 'clone';
 use JSON;
@@ -38,6 +36,7 @@ use DBI;
 use Geo::GDAL;
 use HTTP::Date;
 use File::MkTemp;
+use Encode qw(decode encode is_utf8);
 
 use Data::Dumper;
 use XML::LibXML::PrettyPrint;
@@ -59,21 +58,9 @@ The entry method into this service. Fails unless the request is well known.
 
 sub process_request {
     my ($self, $responder) = @_;
-    $self->parse_request;
     $self->{debug} = $self->{config}{debug} // 0;
-    $self->{responder} = $responder;
-    if ($self->{parameters}{debug}) {
-        $self->error({ 
-            debug => { 
-                config => $self->{config}, 
-                parameters => $self->{parameters}, 
-                env => $self->{env},
-                request => $self->{request} 
-            } });
-        return;
-    }
     if ($self->{debug}) {
-        $self->log({ request => $self->{request}, parameters => $self->{parameters} });
+        $self->log({ parameters => $self->{parameters} });
         my $parser = XML::LibXML->new(no_blanks => 1);
         my $pp = XML::LibXML::PrettyPrint->new(indent_string => "  ");
         if ($self->{posted}) {
@@ -87,6 +74,22 @@ sub process_request {
             say STDERR "filter:\n",$dom->toString;
         }
     }
+    $self->parse_request;
+    $self->{responder} = $responder;
+    if ($self->{parameters}{debug}) {
+        $self->error({ 
+            debug => { 
+                config => $self->{config}, 
+                parameters => $self->{parameters}, 
+                env => $self->{env},
+                request => $self->{request} 
+            } });
+        return;
+    }
+    my ($connect, $user, $pass) = split / /, $self->{config}{ObservationDB};
+    my %attr = (PrintError => 0, RaiseError => 1, AutoCommit => 1);
+    $self->{dbh} = DBI->connect($connect, $user, $pass, \%attr) or $self->error("Can't connect to database");
+    $self->{dbh}->{pg_enable_utf8} = 1;
     for ($self->{request}{request} // '') {
         if (/^GetCapabilities/)         { $self->GetCapabilities() }
         elsif (/^DescribeSensor/)       { $self->DescribeSensor() }
@@ -108,6 +111,7 @@ sub process_request {
                            locator => 'request',
                            ExceptionText => "$self->{request}{request} is not a known request" }) }
     }
+    $self->{dbh}->disconnect;
 }
 
 =pod
@@ -132,7 +136,7 @@ are either simple or complex. The simple root keys are
 sub GetCapabilities {
     my ($self) = @_;
 
-    my $writer = Geo::OGC::Service::XMLWriter::Caching->new();
+    my $writer = Geo::OGC::Service::XMLWriter::Caching->new([$self->CORS]);
 
     my %ns;
     if ($self->{version} eq '2.0.0') {
@@ -191,7 +195,7 @@ sub OperationsMetadata  {
     
     $self->Operation($writer, 'GetObservation', { Get => 1, Post => 1 },
                      [ {offering => [AllowedValues => ['stationid']]},
-                       {observedProperty => [AllowedValues => ['water_temperature']]},
+                       {observedProperty => [AllowedValues => [$self->observed_properties]]},
                        {responseFormat => [AllowedValues => ['text/tab-separated-values']]},
                        {eventTime => [AllowedValues => ['eventTime element']]},
                        {procedure => [AllowedValues => ['procedure element']]},
@@ -220,10 +224,13 @@ sub ObservationOfferingList {
         my @attr = (['gml:description' => $o->{descr}],
                     ['gml:name' => $o->{name}],
                     ['gml:boundedBy' => $o->{env}],
-                    ['sos:time' => $o->{time}],
+                    ['sos:time' => 
+                     ['gml:TimePeriod' => 
+                      [['gml:beginPosition' => $o->{time}[0]],
+                       ['gml:endPosition' => $o->{time}[1]]]]],
                     ['sos:procedure' => $o->{proc}]);
         for my $p (@{$o->{prop}}) {
-            push @attr, ['sos:observedProperty' => $p];
+            push @attr, ['sos:observedProperty' => {'xlink:href' => $p}];
         }
         for my $p (@{$o->{foi}}) {
             push @attr, ['sos:featureOfInterest' => $p];
@@ -261,9 +268,49 @@ sub DescribeSensor {
 
 sub GetObservation {
     my ($self) = @_;
-    $self->error({ exceptionCode => 'NotImplemented',
-                   locator => 'request',
-                   ExceptionText => "$self->{request}{request} is not yet implemented." })
+
+    return $self->error({ exceptionCode => 'MissingParameter',
+                          ExceptionText => "One or more required parameters are missing." },
+        [$self->CORS])
+        unless $self->{request}{offering} &&
+        $self->{request}{observedproperty} &&
+        $self->{request}{eventtime};
+    
+    # select time,value from sensor_data where id= and prop= and <=time<=
+    # output format = json, xml, csv, tab-separated-value
+
+    my @data;
+    my $id = $self->{request}{offering};
+    my $prop = "(prop='";
+    $prop .= join "' or prop='", @{$self->{request}{observedproperty}};
+    $prop .= "')";
+    my $time = '(';
+    for my $t (@{$self->{request}{eventtime}}) {
+        if (ref $t) {
+            $time .= "(time>='$t->[0]' and time<='$t->[1]')";
+        } else {
+            $t = $self->latest_offering($id) if $t eq 'latest';
+            $time .= "time='$t'";
+        }
+        $time .= ' or '
+    }
+    $time =~ s/ or $//;
+    $time .= ')';
+    my $sql = "select time,value,prop from sensor_data where id='$id' and $prop and $time order by time";
+    my $sth = $self->{dbh}->prepare($sql);
+    $sth->execute();
+    while (my $row = $sth->fetchrow_hashref) {
+        push @data, $row;
+    }
+
+    my $json = JSON->new;
+    $json->utf8;
+    $self->{responder}->(
+        [200, 
+         [ 'Content-Type' => 'application/json; charset=utf-8',
+           'Access-Control-Allow-Origin' => '*' ],
+         [$json->encode(\@data)]
+        ]);
 }
 
 =pod
@@ -388,11 +435,21 @@ sub parse_request {
     if ($self->{posted}) {
         $self->{request} = ogc_request($self->{posted});
     } elsif ($self->{parameters}) {
-        $self->{request} = {
-            request => $self->{parameters}{request},
-            version => $self->{parameters}{version},
-            outputformat => $self->{parameters}{outputformat}
-        };
+        $self->{request} = {};
+        for my $param (qw/service request version outputformat 
+        offering responseformat unit/) {
+            $self->{request}{$param} = $self->{parameters}{$param};
+        }
+        for my $param (qw/observedproperty/) {
+            push @{$self->{request}{$param}}, $self->{parameters}{$param};
+        }
+        if ($self->{parameters}{eventtime}) {
+            if ($self->{parameters}{eventtime} =~ /\//) {
+                push @{$self->{request}{eventtime}}, [split(/\//, $self->{parameters}{eventtime})];
+            } else {
+                push @{$self->{request}{eventtime}}, $self->{parameters}{eventtime};
+            }
+        }
     }
 
     my %defaults = (
@@ -407,30 +464,109 @@ sub parse_request {
     }
     # version negotiation
     $self->{version} = 
-        latest_version($self->{parameters}{acceptversions}) // # not in standard, QGIS WFS 2.0 Client uses
+        latest_version($self->{parameters}{acceptversions}) //
         $self->{request}{version} // 
         $self->{config}{version};
+}
+
+# return SOS request in a hash
+# this function is written according to SOS 1.0.0 (need to add 2.0.0)
+sub ogc_request {
+    my ($node) = @_;
+    my ($ns, $name) = parse_tag($node);
+    if ($name eq 'GetCapabilities') {
+        return { service => $node->getAttribute('service'), 
+                 request => $name,
+                 version => $node->getAttribute('version') };
+
+    } elsif ($name eq 'DescribeSensor') {
+
+        return {};
+
+    } elsif ($name eq 'GetObservation') {
+        my $request = { request => 'GetObservation' };
+        for my $a (qw/service version/) { # srsName?
+            my $b = $node->getAttribute($a);
+            $request->{$a} = $b if $b;
+        }
+        for ($node = $node->firstChild; $node; $node = $node->nextSibling) {
+            my ($ns, $name) = parse_tag($node);
+            if ($name eq 'eventTime') {
+                # TM_Equals -> timePosition, TM_During -> beginPosition endPosition
+                my $t;
+                for my $time ($node->getElementsByTagNameNS('*', 'timePosition')) {
+                    $t = $time->textContent;
+                }
+                for my $time ($node->getElementsByTagNameNS('*', 'beginPosition')) {
+                    $t = [] unless $t;
+                    $t->[0] = $time->textContent;
+                }
+                for my $time ($node->getElementsByTagNameNS('*', 'endPosition')) {
+                    $t = [] unless $t;
+                    $t->[1] = $time->textContent;
+                }
+                push @{$request->{eventtime}}, $t;
+            } elsif ($name eq 'observedProperty' or $name eq 'procedure') {
+                push @{$request->{lc($name)}}, $node->textContent;
+            } else { 
+                # offering featureOfInterest 
+                # result responseFormat resultModel responseMode
+                $request->{lc($name)} = $node->textContent;
+            }
+        }
+        return $request;
+
+    }
+    return {};
 }
 
 sub offerings {
     my $self = shift;
     my @offerings;
 
-    my $o = {
-        id => 0,
-        descr => 'Description',
-        name => 'Name',
-        env => 'GML Envelope here',
-        time => 'Timeperiod of measurements?',
-        proc => 'Procedure how this was done',
-        prop => ['Observed property 1', 'Observed property 2'],
-        foi => ['Feature of interest 1', 'feature of interest 2'],
-        'format' => ['response format 1', 'response format 2'],
-        model => 'om:Result model here',
-        mode => 'response mode?',
-    };
-    push @offerings, $o;
+    #binmode STDERR, ":utf8";
+    my $sth = $self->{dbh}->prepare($self->{config}{offerings});
+    $sth->execute();
+    while (my $row = $sth->fetchrow_hashref) {
+        for my $key (qw/time prop foi format/) {
+            $row->{$key} = to_arrayref($row->{$key}) unless ref $row->{$key};
+        }
+        push @offerings, $row;
+    }
+
     return @offerings;
+}
+
+sub observed_properties {
+    my $self = shift;
+    my %prop;
+    my $sth = $self->{dbh}->prepare($self->{config}{offerings});
+    $sth->execute();
+    while (my $row = $sth->fetchrow_hashref) {
+        my $prop = $row->{prop};
+        $prop = to_arrayref($prop) unless ref $prop;
+        for my $p (@$prop) {
+            $prop{$p} = 1;
+        }
+    }
+    return keys %prop;
+}
+
+sub latest_offering {
+    my ($self, $offering) = @_;
+    my $sth = $self->{dbh}->prepare("select time[2] from offerings where id='$offering'");
+    $sth->execute();
+    while (my $time = $sth->fetchrow_array) {
+        return $time;
+    }
+}
+
+sub to_arrayref {
+    my $list = shift;
+    $list =~ s/^{"//;
+    $list =~ s/"}$//;
+    my @ary = split /"\s*,\s*"/, $list;
+    return [@ary];
 }
 
 1;
